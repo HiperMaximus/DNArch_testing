@@ -98,25 +98,65 @@ class SIREN(nn.Module):
         out_features (int): Number of output features.
         omega_0 (float): The frequency parameter for the sine activation.
                          Typically 30.0 for the first layer and subsequent layers.
-        is_first (bool): If True, initializes weights for the first layer according
-                         to SIREN paper. Default is False.
+        fixup_init (bool | None): Flag to apply fixup initialization.
+        max_layers_l (int | None): Maximum number of residual layers.
+        linear_layers_m (int | None): Number of linear layers in each residual branch.
 
     """
 
-    def __init__(self, input_features: int, out_features: int, list_hidden_features: list[int], omega_0: float = 30.0) -> None:
+    def __init__(
+        self,
+        input_features: int,
+        out_features: int,
+        list_hidden_features: list[int],
+        omega_0: float = 30.0,
+        fixup_init: bool | None = None,
+        is_for_bias_generation: bool | None = None,
+        max_layers_l: int | None = None,
+        linear_layers_m: int | None = None,
+        final_bias_init_value: float | None = None,  # Or some other value to make sigmoid(3.0) ~ 0.95
+    ) -> None:
         """Initialize the SIREN.
 
         Args:
             input_features (int): Number of input features.
             out_features (int): Number of output features.
-            list_hidden_features (list[int]): List of integers representing the number of in/out features
-                                            for each layer in the SIREN.
+            list_hidden_features (list[int]): List of integers representing the number
+                                            of in/out features for each layer in the SIREN.
             omega_0 (float): The frequency parameter for the sine activation.
-                             Typically 30.0 for the first layer and subsequent layers.
+                            Typically 30.0 for the first layer and subsequent layers.
+            fixup_init (bool | None): Flag to apply fixup initialization.
+            is_for_bias_generation (bool | None): Flag to generate biases or not.
+            max_layers_l (int | None): Maximum number of residual layers in the whole network.
+            linear_layers_m (int | None): Number of linear layers in each residual branch.
 
 
         """
         super().__init__()
+        # Param validation
+        if input_features <= 0:
+            msg = "Input features must be a positive integer."
+            raise ValueError(msg)
+        if out_features <= 0:
+            msg = "Output features must be a positive integer."
+            raise ValueError(msg)
+        if list_hidden_features:
+            msg = "List of hidden features cannot be empty (min 2 linear layers)."
+            raise ValueError(msg)
+
+        # Fixup parameter validation
+        apply_fixup_scaling = False
+        if fixup_init:
+            if not isinstance(max_layers_l, int) or max_layers_l <= 0:
+                msg = "If fixup_init is True, max_layers_l must be a positive integer."
+                raise ValueError(msg)
+            if not isinstance(linear_layers_m, int) or linear_layers_m <= 1:
+                # m must be >= 2 (at least 2 linear like layers per branch)
+                msg = f"If fixup_init is True, linear_layers_m must be an integer >= 2, got {linear_layers_m}."
+                raise ValueError(msg)
+            apply_fixup_scaling = True
+
+        # Init SIREN
         list_num_features: list[int] = [input_features, *list_hidden_features]
         self.layers: nn.ModuleList = nn.ModuleList()
         for i in range(len(list_num_features) - 1):
@@ -134,6 +174,21 @@ class SIREN(nn.Module):
             bias=True,
         )
 
+        # Apply fixup init
+        if apply_fixup_scaling and max_layers_l and linear_layers_m:
+            if is_for_bias_generation:
+                with torch.no_grad():
+                    self.final_layer.weight.data.zero_()  # Make weights zero
+                    self.final_layer.bias.data.zero_()  # Make bias zero
+                    # This ensures the SIREN output is exactly 0.0
+            else:
+                scale_factor: float = max_layers_l ** (-1.0 / (2 * linear_layers_m - 2))
+                with torch.no_grad():
+                    self.final_layer.weight.data *= scale_factor
+                    self.final_layer.bias.data.zero_()
+        elif final_bias_init_value is not None:
+            with torch.no_grad():
+                self.final_layer.bias.data.fill_(final_bias_init_value)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the SIREN.
 

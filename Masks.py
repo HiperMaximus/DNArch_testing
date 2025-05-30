@@ -1,3 +1,12 @@
+"""Mask generation modules for DNArch, including Gaussian, Sigmoid, and Radial Sigmoid masks.
+
+The parameters of the masks are used to calculate the computational loss, but it is important
+that the cutoff of the paremeters allow for smooth gradients so it is necessary to keep a
+minimum size of the gaussian mask (for example a minum kernel size of 3x3) as well as the sigmoid
+maks (for example minium number of channels = 2 and minimum number of layers = 2), so it is
+necessary to control the variance and temperature of the masks.
+"""
+
 import math
 
 import torch
@@ -16,6 +25,7 @@ class GaussianMask2D(nn.Module):
         mask(x, y) = exp(-0.5 * ((x^2 / var_x) + (y^2 / var_y)))
     where var_x and var_y are the variances in the x and y directions, respectively.
     The mask is applied to the coordinates (x, y) and thresholded to create a binary mask.
+    The means are assumed to be 0 for a centered mask.
     """
 
     def __init__(
@@ -38,11 +48,15 @@ class GaussianMask2D(nn.Module):
         """
         super().__init__()
         # --- Input Validation ---
-        if not (0.0 < threshold < 1.0):  # Threshold must be (0,1) for log(Tm)
-            msg = f"Threshold must be in the range (0.0, 1.0), got {threshold}"
+        max_threshold = 0.5
+        if not (0.0 < threshold < max_threshold):
+            msg = f"Threshold must be in the range (0.0, 0.5), got {threshold}"
             raise ValueError(msg)
         if max_kernel_span_x <= 1 or max_kernel_span_y <= 1:
             msg = f"max_kernel_span_x ({max_kernel_span_x}) and max_kernel_span_y ({max_kernel_span_y}) must be greater than 1"
+            raise ValueError(msg)
+        if max_kernel_span_x % 2 == 0 or max_kernel_span_y % 2 == 0:
+            msg = "max_kernel_span_x and max_kernel_span_y should be odd for simple centered coordinates."
             raise ValueError(msg)
         if initial_sigma_x <= 0.0 or initial_sigma_y <= 0.0:
             msg = f"initial_sigma_x ({initial_sigma_x}) and initial_sigma_y ({initial_sigma_y}) must be positive"
@@ -58,6 +72,7 @@ class GaussianMask2D(nn.Module):
         step_size_y: float = 2 / (max_kernel_span_y - 1)
         self.log_min_var_x: float = math.log((step_size_x**2) / (-2 * math.log(threshold)))
         self.log_min_var_y: float = math.log((step_size_y**2) / (-2 * math.log(threshold)))
+        self.min_span_pixels = 3.0
         # --- Learnable log_var (log of variance) parameters ---
         initial_var_x: float = initial_sigma_x**2
         initial_var_y: float = initial_sigma_y**2
@@ -85,12 +100,28 @@ class GaussianMask2D(nn.Module):
         # scale to pixel-counts (full width)
         size_x: torch.Tensor = (hw_x / self.initial_size_x) * self.max_kernel_span_x
         size_y: torch.Tensor = (hw_y / self.initial_size_y) * self.max_kernel_span_y
-
+        final_size_x = torch.clamp(size_x, min=self.min_span_pixels, max=float(self.max_kernel_span_x))
+        final_size_y = torch.clamp(size_y, min=self.min_span_pixels, max=float(self.max_kernel_span_y))
         # stack as [height, width]
-        return torch.stack((size_x, size_y), dim=0)
+        return torch.stack((final_size_y, final_size_x), dim=0)
 
-    def forward(self, y_coords: torch.Tensor, x_coords: torch.Tensor) -> torch.Tensor:
-        """Generate the 2D Gaussian mask, assuming mu=0."""
+    def forward(self, x_coords: torch.Tensor, y_coords: torch.Tensor) -> torch.Tensor:
+        """Generate the 2D Gaussian mask, assuming mu=0.
+
+        The coordinates are expected to already be selected from a normalized grid [-1,1].
+        The selection means that the coords are [-sel:sel] calculated from
+        the get_mask_size function.
+
+        Args:
+            x_coords (torch.Tensor): Selected coordinates for the x-axis.
+            y_coords (torch.Tensor): Selected coordinates for the y-axis.
+
+        Returns:
+            torch.Tensor: 2D tensor representing the Gaussian mask to multiply
+            with the kernel.
+
+
+        """
         # 1) clamp σ
         self.apply_var_constraints()
 
@@ -98,19 +129,11 @@ class GaussianMask2D(nn.Module):
         var_x = torch.exp(self.log_var_x).clamp(min=1e-12)
         var_y = torch.exp(self.log_var_y).clamp(min=1e-12)
 
-        # 3) build quarter‐mask on positive coords
-        xg = x_coords.unsqueeze(0) # 1×(N//2+1)
-        yg = y_coords.unsqueeze(1) # (N//2+1)×1
-        q = torch.exp(-0.5*(yg**2/var_y + xg**2/var_x))
-        q = torch.where(q >= self.threshold, q, torch.zeros_like(q))
-
-        # 4) mirror to full mask:
-        #    -(y,x) axes.   remove the duplicated zero‐line when concatenating.
-        top    = torch.cat([q.flip(0)[1:], q], dim=0)      # full rows
-        bottom = top.flip(1)                                # full columns
-        full   = torch.cat([top, bottom[:,1:]], dim=1)      # shape N×N
-
-        return full
+        # 3) build gaussian-mask
+        xg = x_coords.unsqueeze(0)  # 1x(N)
+        yg = y_coords.unsqueeze(1)  # (M)x1
+        q = torch.exp(-0.5 * (yg**2 / var_y + xg**2 / var_x))
+        return torch.where(q >= self.threshold, q, torch.zeros_like(q))
 
 
 
@@ -153,6 +176,7 @@ class SigmoidMask1D(nn.Module):
 
         self.max_span = max_span
         self.threshold = threshold
+        self.min_active_elements_float = 2.0
         # one channel = one step in [0,1]
         self.step = 1.0 / max_span
 
@@ -165,7 +189,7 @@ class SigmoidMask1D(nn.Module):
 
         # stability floors
         self.min_temperature = 1e-6
-        self.max_temperature = 100.0
+        self.max_temperature = 15.0
 
     def apply_var_constraints(self) -> None:
         """Clamp so that x_T ≥ 0 (ensuring channel 0 survives), and τ>0."""
@@ -179,10 +203,11 @@ class SigmoidMask1D(nn.Module):
 
         The size is determined by the offset and temperature parameters.
         """
-        self.apply_var_constraints()
         size_x = self.offset - (1.0 / self.temperature) * self.logit_inv
-        size_x.clamp_(min=0.0, max=1.0)  # ensure size is in [0,1]
-        return torch.tensor(self.max_span * size_x, dtype=torch.float32)
+        num_elements_float = self.max_span * size_x
+        # Clamp to ensure the reported size meets the minimum and respects max_span
+        return torch.clamp(num_elements_float, min=self.min_active_elements_float, max=float(self.max_span))
+
 
     def forward(self, x_coords: torch.Tensor) -> torch.Tensor:
         """Generate the 1D Sigmoid mask.
@@ -190,14 +215,18 @@ class SigmoidMask1D(nn.Module):
         The mask is defined by the sigmoid function:
             mask(x) = 1 - σ(τ(x - μ))
 
+        The coordinates are expected to already be selected from a normalized grid [0,1].
+        The selection means that the coords are [0:sel] calculated from
+        the get_mask_size function.
+
         Args:
             x_coords (torch.Tensor): 1D tensor of coordinates [0,1].
         returns:
             torch.Tensor: 1D tensor representing the mask.
 
         """
-        mask_val = 1.0 - torch.sigmoid(self.temperature * (x_coords - self.offset))
-        return torch.where(mask_val >= self.threshold, mask_val, torch.zeros_like(mask_val))
+        return 1.0 - torch.sigmoid(self.temperature * (x_coords - self.offset))
+
 
 class RadialSigmoidMask2D(nn.Module):
     """Radial (isotropic) 2D sigmoid mask for Fourier downsampling.
@@ -208,15 +237,16 @@ class RadialSigmoidMask2D(nn.Module):
 
     def __init__(
         self,
-        initial_offset: float = 0.8,      # μ in normalized radius space
-        initial_temperature: float = 1.0, # τ (scale)
-        threshold: float = 0.1,           # T ∈ (0,0.5)
-        max_radius: float = math.sqrt(2), # max r you’ll ever feed in
-        grid_size: int = 64,              # optional, just for computing radial_step
+        initial_offset: float = 0.8,  # μ in normalized radius space
+        initial_temperature: float = 1.0,  # τ (scale)
+        threshold: float = 0.1,  # T ∈ (0,0.5)
+        max_radius: float = math.sqrt(2),  # max r you’ll ever feed in
+        grid_size: int = 64,  # optional, just for computing radial_step
     ) -> None:
         super().__init__()
         # --- Validation ---
-        if not (0.0 < threshold < 0.5):
+        max_threshold = 0.5
+        if not (0.0 < threshold < max_threshold):
             msg = f"threshold must be in (0,0.5), got {threshold}"
             raise ValueError(msg)
         if not (0.0 < initial_offset <= max_radius):
@@ -225,12 +255,12 @@ class RadialSigmoidMask2D(nn.Module):
         if initial_temperature <= 0:
             msg = f"initial_temperature must be >0, got {initial_temperature}"
             raise ValueError(msg)
-        if grid_size < 2:
-            msg = f"grid_size must be ≥2, got {grid_size}"
+        if grid_size <= 1:
+            msg = f"grid_size must be greater than 2, got {grid_size}"
             raise ValueError(msg)
 
         self.threshold = threshold
-        self.logit_inv = math.log(1/(1-threshold) - 1)   # solves 1−σ(τ(x−μ))=T
+        self.logit_inv = math.log(1 / (1 - threshold) - 1)  # solves 1−σ(τ(x−μ))=T
         self.max_radius = max_radius
 
         # radial_step = smallest nonzero r on your fx/fy grid:
@@ -275,23 +305,21 @@ class RadialSigmoidMask2D(nn.Module):
         # 1) enforce μ,τ constraints
         self.apply_constraints()
 
-        # 2) build quarter‐plane coords
-        C = self.R//2 + 1
+        # 2) build quarter-plane coords
+        num_coords = int(self.radial_step // 2 + 1)
         # fx: [0,1] len=C
-        fx_q = torch.linspace(0.0, 1.0, steps=C, device=self.offset.device)
+        fx_q = torch.linspace(0.0, 1.0, steps=num_coords, device=self.offset.device)
         # fy: [0,1] len=C  (only nonnegatives)
-        fy_q = torch.linspace(0.0, 1.0, steps=C, device=self.offset.device)
+        fy_q = torch.linspace(0.0, 1.0, steps=num_coords, device=self.offset.device)
 
-        fx2d = fx_q.unsqueeze(0).expand(C, -1)   # (C, C)
-        fy2d = fy_q.unsqueeze(1).expand(-1, C)   # (C, C)
+        fx2d = fx_q.unsqueeze(0).expand(num_coords, -1)  # (C, C)
+        fy2d = fy_q.unsqueeze(1).expand(-1, num_coords)  # (C, C)
 
         # 3) compute radial mask on quarter
         r_q = torch.sqrt(fx2d**2 + fy2d**2)
         q = 1.0 - torch.sigmoid(self.temperature * (r_q - self.offset))
         q = torch.where(q >= self.threshold, q, torch.zeros_like(q))
 
-        # 4) mirror across fy=0 to get full half-plane (R×C)
-        #   - drop the duplicated zero‐row at index 0 when mirroring
-        top    = torch.cat([q.flip(0)[1:], q], dim=0)    # (R, C)
-
-        return top
+        # 4) mirror across fy=0 to get full half-plane (RxC)
+        #   - drop the duplicated zero-row at index 0 when mirroring
+        return torch.cat([q.flip(0)[1:], q], dim=0)  # (R, C)

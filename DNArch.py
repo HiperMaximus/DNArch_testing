@@ -89,6 +89,9 @@ DNArch is organized around the following meta-components and step-by-step proced
 import torch
 from torch import nn
 
+from Masks import GaussianMask2D, SigmoidMask1D
+from SIREN import SIREN
+
 
 class ResidualBranch(nn.Module):
     """Residual branch class.
@@ -136,8 +139,7 @@ class ResidualBranch(nn.Module):
             bias_pointwise (torch.Tensor): Pointwise convolution bias, with shape (C,).
             depthwise_kernel (torch.Tensor): Depthwise convolution kernel, with shape (C, 1, K_h, K_w).
             bias_depthwise (torch.Tensor): Depthwise convolution bias, with shape (C,).
-            fourier_mask_centered_rfft (torch.Tensor): Mask for Fourier space, with shape (H_feat,
-            W_feat//2 + 1).
+            fourier_mask_centered_rfft (torch.Tensor): Mask for Fourier space, with shape (H_feat, W_feat//2 + 1).
 
         Returns:
             torch.Tensor: Output tensor after processing through the residual branch, with shape
@@ -145,11 +147,8 @@ class ResidualBranch(nn.Module):
 
         """
         height_feat, width_feat = x.shape[-2:]
-        skip = x  # Save the input for the skip connection
-        x = nn.functional.conv2d(input=x + self.bias_before_pw,
-                                weight=pointwise_kernel,
-                                bias=bias_pointwise,
-                                padding="same")
+        skip: torch.Tensor = x  # Save the input for the skip connection
+        x = nn.functional.conv2d(input=x + self.bias_before_pw, weight=pointwise_kernel, bias=bias_pointwise, padding="same")
         x = self.activation1(x)
         x = nn.functional.conv2d(
             input=x + self.bias_before_dw,
@@ -196,7 +195,7 @@ class Encoder(nn.Module):
 
         Args:
             image_size (int): Size of square image.
-            latent_dim (int): Dimension of the latent space.
+            latent_dim (int): Dimension/size of the latent space.
             max_layers (int): Maximum number of layers in the architecture.
             max_channels_residual (int): Maximum number of channels in the residual branch.
             max_channels_skip (int): Maximum number of channels in the identity branch.
@@ -204,15 +203,69 @@ class Encoder(nn.Module):
 
         """
         super().__init__()
-        # Initialize encoder parameters
-        self.image_size = image_size
-        self.latent_dim = latent_dim
-        self.max_layers = max_layers
-        self.max_channels_residual = max_channels_residual
-        self.max_channels_skip = max_channels_skip
-        self.max_kernel_size = max_kernel_size
 
-        # Define layers and SIRENs here as needed
+        # Initialize encoder parameters
+        self.image_size: int = image_size
+        self.latent_dim: int = latent_dim
+        self.max_layers: int = max_layers
+        self.max_channels_residual: int = max_channels_residual
+        self.max_channels_skip: int = max_channels_skip
+        self.max_kernel_size: int = max_kernel_size
+
+        # --- Learnable Architectural Networks (SIRENs) ---
+
+        # Pointwise kernel generation
+        # input_features := (layer,channel)
+        self.pointwise_siren = SIREN(
+            input_features=2,
+            out_features=1,
+            list_hidden_features=[128, 128, 128],
+            omega_0=20.0,
+            fixup_init=True,
+            max_layers_l=self.max_layers,
+            linear_layers_m=2,
+        )
+        # input_features := (layer,channel)
+        self.pointwise_bias_siren = SIREN(
+            input_features=2,
+            out_features=1,
+            list_hidden_features=[16, 16, 16],
+            omega_0=20.0,
+            fixup_init=True,
+            is_for_bias_generation=True,
+            max_layers_l=self.max_layers,
+            linear_layers_m=2,
+        )
+        # Depthwise kernel generation
+        # input_features := (layer,channel,k_x,k_y)
+        self.depthwise_siren = SIREN(
+            input_features=4,
+            out_features=1,
+            list_hidden_features=[128, 128, 128, 128],
+            omega_0=20.0,
+            fixup_init=True,
+            max_layers_l=self.max_layers,
+            linear_layers_m=2,
+        )
+        # input_features := (layer,channel)
+        self.depthwise_bias_siren = SIREN(
+            input_features=2,
+            out_features=1,
+            list_hidden_features=[16, 16, 16],
+            omega_0=20.0,
+            fixup_init=True,
+            is_for_bias_generation=True,
+            max_layers_l=self.max_layers,
+            linear_layers_m=2,
+        )
+        # input_features := (layer,radius_coord)
+        self.mask_siren = nn.Sequential(
+            SIREN(input_features=2, out_features=1, list_hidden_features=[10, 8, 4], omega_0=10.0, final_bias_init_value=3.0),
+            nn.Sigmoid(),
+        )
+        self.res_layers: nn.ModuleList = nn.ModuleList()
+        for _ in range(self.max_layers):
+            self.res_layers.append(ResidualBranch())
 
 
 class Decoder(nn.Module):
